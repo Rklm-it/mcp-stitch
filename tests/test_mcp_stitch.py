@@ -94,13 +94,41 @@ def test_rejected_key_leaves_hub_untouched(hub):
     assert not hub["site"].exists()
 
 
-@pytest.mark.parametrize("bad", ['AIza"; respond 200 #xxxxxxxx', "short", ""])
-def test_malformed_key_rejected_before_network(hub, bad):
+@pytest.mark.parametrize("bad,why", [
+    ('AIza"; respond 200 #xxxxxxxx', "«\"#;»"),
+    ("AIza{env.HOME}xxxxxxxxxxxxxxxx", "«{}»"),
+    ("ключ_русскими_буквами_длинный", "не латиница"),
+    ("short", "всего 5 символов"),
+    ("", "ничего не введено"),
+])
+def test_malformed_key_rejected_before_network(hub, bad, why):
     hub["tty"].write_text(bad + "\n")
     r = run(hub, "set-key")
     assert r.returncode != 0
+    assert why in r.stderr, r.stderr
+    if len(bad) > 5:
+        assert bad not in r.stderr + r.stdout, "ключ в выводе"
     assert not hub["site"].exists()
     assert UPSTREAM not in hub["log"].read_text()
+
+
+@pytest.mark.parametrize("key", [
+    "AQ.Ab8RN6Lx_new-format-key.0123456789abcdef",  # новые ключи Google — с точкой
+    "AIzaSyD-legacyFormat_0123456789abcdefgh",
+])
+def test_google_key_formats_accepted(hub, key):
+    hub["tty"].write_text(key + "\n")
+    r = run(hub, "set-key", STUB_GOOD_KEY=key)
+    assert r.returncode == 0, r.stderr
+    assert f'X-Goog-Api-Key "{key}"' in hub["site"].read_text()
+
+
+def test_bracketed_paste_markers_stripped(hub):
+    """Терминал с «вставкой в скобках» присылает ESC[200~ключESC[201~."""
+    hub["tty"].write_text(f"\x1b[200~ {KEY} \x1b[201~\n")
+    r = run(hub, "set-key")
+    assert r.returncode == 0, r.stderr
+    assert f'X-Goog-Api-Key "{KEY}"' in hub["site"].read_text()
 
 
 def test_key_from_stdin_without_terminal(hub):

@@ -65,9 +65,32 @@ connector_url() {
     echo "$(hub_url)/stitch/mcp/$s"
 }
 
-# Ключи Google — буквы, цифры, «-» и «_». Заодно кавычка или перевод строки не
-# сломают Caddyfile.
-valid_key() { [[ "$1" =~ ^[A-Za-z0-9_-]{20,200}$ ]]; }
+# Формат ключа проверяет сам Google (живым запросом в set-key). Здесь — только
+# то, что сломало бы Caddyfile: кавычки, «\\», фигурные скобки (плейсхолдеры
+# Caddy), пробелы. Точка, «+», «/», «=», «~» в ключах Google бывают (AQ.…).
+valid_key() { [[ "$1" =~ ^[A-Za-z0-9._~+/=-]{20,300}$ ]]; }
+
+# Почему ключ не принят — без самого ключа: длина и чужие символы.
+key_problem() {
+    local k="$1" odd
+    if [ -z "$k" ]; then
+        echo "ничего не введено. Вставьте ключ и нажмите Enter — символы при вводе не видны, так задумано"
+        return
+    fi
+    odd="$(printf '%s' "$k" | LC_ALL=C tr -d 'A-Za-z0-9._~+/=-')"
+    if [ -n "$odd" ]; then
+        local what=""
+        what="$(printf '%s' "$odd" | LC_ALL=C tr -dc '\041-\176' | fold -w1 | sort -u | tr -d '\n')"
+        [ -n "$what" ] && what="«$what»"
+        printf '%s' "$odd" | LC_ALL=C grep -q '[^ -~]' && what="${what:+$what и }не латиница (раскладка, кавычки-ёлочки)"
+        printf '%s' "$odd" | grep -q ' ' && what="${what:+$what и }пробел"
+        echo "в ключе ${what:-лишние символы}, длина ${#k}. Скопируйте ключ заново кнопкой копирования в Stitch settings"
+    elif [ "${#k}" -gt 300 ]; then
+        echo "длина ${#k} — слишком длинно для ключа. Вставилось лишнее?"
+    else
+        echo "всего ${#k} символов — коротко для ключа (обычно 39 и больше). Скопирован не весь?"
+    fi
+}
 
 INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"mcp-stitch","version":"1"}}}'
 LIST='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
@@ -169,6 +192,8 @@ read_key() {
     else
         IFS= read -r k || k=""
     fi
+    # Без пробелов по краям и маркеров «вставки» терминала (ESC[200~ … ESC[201~).
+    k="${k//$'\e[200~'/}"; k="${k//$'\e[201~'/}"
     printf '%s' "$k" | tr -d ' \r\n\t'
 }
 
@@ -176,8 +201,7 @@ cmd_set_key() {
     need_hub
     echo "Ключ: stitch.withgoogle.com → аватар справа вверху → Stitch settings → API key → Create key."
     local key; key="$(read_key)"
-    [ -n "$key" ] || die "ключ пустой"
-    valid_key "$key" || die "это не похоже на ключ Stitch (буквы, цифры, - и _; от 20 символов)"
+    valid_key "$key" || die "ключ не принят: $(key_problem "$key")"
     local hf n; hf="$(key_header_file "$key")"
     if ! n="$(mcp_tools "$STITCH_URL" "$hf")"; then rm -f "$hf"; die "Stitch не принял ключ — причина выше"; fi
     rm -f "$hf"
