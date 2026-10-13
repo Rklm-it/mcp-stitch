@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Заглушка curl для тестов: MCP-сервер Stitch и хаб перед ним.
+
+Апстрим (адрес из MCP_STITCH_UPSTREAM) пускает только с ключом STUB_GOOD_KEY
+в заголовке из файла (-H @файл). Адрес хаба отвечает, если STUB_HUB_OK=1.
+Каждый вызов пишет свой argv строкой в STUB_LOG — по нему тест проверяет,
+что ключ не светился в командной строке.
+"""
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+with open(os.environ["STUB_LOG"], "a", encoding="utf-8") as f:
+    f.write(json.dumps(args) + "\n")
+
+headers, out, dump, wfmt, data, url = [], None, None, None, None, None
+i = 0
+while i < len(args):
+    a = args[i]
+    if a in ("-H", "-o", "-D", "-w", "-d", "-X", "-m", "--connect-timeout"):
+        v = args[i + 1]
+        if a == "-H":
+            if v.startswith("@"):
+                with open(v[1:], encoding="utf-8") as hf:
+                    headers += [ln.strip() for ln in hf if ln.strip()]
+            else:
+                headers.append(v)
+        elif a == "-o":
+            out = v
+        elif a == "-D":
+            dump = v
+        elif a == "-w":
+            wfmt = v
+        elif a == "-d":
+            data = v
+        i += 2
+        continue
+    if not a.startswith("-"):
+        url = a
+    i += 1
+
+if url and url.startswith("file://"):  # установщик качает команду «с GitHub»
+    with open(url[7:], encoding="utf-8") as src, open(out, "w", encoding="utf-8") as dst:
+        dst.write(src.read())
+    sys.exit(0)
+
+upstream = os.environ.get("MCP_STITCH_UPSTREAM", "")
+if url == upstream:
+    good = f"X-Goog-Api-Key: {os.environ.get('STUB_GOOD_KEY', '')}"
+    code = 200 if good in headers else 401
+else:
+    code = 200 if os.environ.get("STUB_HUB_OK") == "1" else 502
+
+body = '{"error":"denied"}'
+if code == 200 and data:
+    method = json.loads(data).get("method")
+    if method == "initialize":
+        body = 'data: {"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"stitch"}}}\n\n'
+    elif method == "tools/list":
+        tools = [{"name": f"t{n}", "inputSchema": {"type": "object"}} for n in range(3)]
+        body = "data: " + json.dumps({"jsonrpc": "2.0", "id": 2, "result": {"tools": tools}}) + "\n\n"
+    else:
+        body = ""
+
+if dump:
+    with open(dump, "w", encoding="utf-8") as f:
+        f.write(f"HTTP/1.1 {code}\r\nMcp-Session-Id: sess-1\r\n\r\n")
+if out and out != "/dev/null":
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(body)
+if wfmt:
+    sys.stdout.write(wfmt.replace("%{http_code}", str(code)))
+sys.exit(0)

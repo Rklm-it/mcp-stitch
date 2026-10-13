@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# =============================================================================
+# mcp-stitch — Google Stitch (дизайн экранов) коннектором claude.ai через хаб.
+#
+#   mcp-stitch                — состояние и ссылка коннектора (то же: status)
+#   mcp-stitch url            — только ссылка коннектора
+#   mcp-stitch set-key        — ввести/сменить ключ Stitch (ввод скрыт, проверка живым запросом)
+#   mcp-stitch check          — сквозная проверка: хаб → Stitch, как ходит claude.ai
+#   mcp-stitch rotate-secret  — новый секрет в ссылке (старая ссылка перестаёт работать)
+#   mcp-stitch off            — убрать маршрут (ключ стирается)
+#   mcp-stitch update         — обновить эту команду с GitHub
+#
+# Зачем прослойка. У Google свой MCP-сервер Stitch (https://stitch.googleapis.com/mcp),
+# но ключ он принимает только заголовком X-Goog-Api-Key, а коннектор claude.ai
+# умеет лишь адрес. Caddy хаба nexus-mcp отдаёт https://<хаб>/stitch/mcp/<секрет>
+# в Stitch и сам подставляет ключ: в claude.ai — обычный коннектор, ключ — на хабе.
+#
+# Ключ живёт в одном месте — маршруте Caddy (sites/mcp-stitch.caddy, 0600). Он в
+# каталоге Caddy хаба, поэтому едет в бэкапах хаба и при его переезде.
+#
+# Ключ никогда не попадает в argv (его видно в ps): в curl — заголовком из
+# файла (-H @файл), в эту команду — с терминала или из stdin.
+# =============================================================================
+set -uo pipefail
+
+# Пути подменяются только тестами.
+HUB_CADDY="${MCP_STITCH_HUB_CADDY:-/etc/caddy-nexus-mcp}"
+HUB_ENV="${MCP_STITCH_HUB_ENV:-/etc/nexus-mcp.env}"
+SITE="$HUB_CADDY/sites/mcp-stitch.caddy"
+CADDYFILE="$HUB_CADDY/Caddyfile"
+STITCH_URL="${MCP_STITCH_UPSTREAM:-https://stitch.googleapis.com/mcp}"
+SRC="https://raw.githubusercontent.com/Rklm-it/mcp-stitch/main"
+TTY="${MCP_STITCH_TTY:-/dev/tty}"
+
+if [ -t 1 ]; then G=$'\033[32m'; R=$'\033[31m'; Y=$'\033[33m'; D=$'\033[2m'; N=$'\033[0m'; else G=""; R=""; Y=""; D=""; N=""; fi
+ok()  { echo "${G}✓${N} $*"; }
+bad() { echo "${R}✗${N} $*" >&2; }
+die() { bad "$*"; exit 1; }
+
+[ "$(id -u)" = "0" ] || [ -n "${MCP_STITCH_ALLOW_NONROOT:-}" ] || die "нужен root"
+
+envget() { grep -E "^$1=" "$2" 2>/dev/null | tail -1 | cut -d= -f2- || true; }
+gen() { head -c 96 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c "$1"; }
+
+hub_url() {
+    local d p
+    d="$(envget NEXUS_MCP_PUBLIC_HOSTS "$HUB_ENV")"; p="$(envget NEXUS_MCP_PUBLIC_PORT "$HUB_ENV")"
+    d="${d%%,*}"
+    [ -n "$d" ] || return 1
+    if [ -z "$p" ] || [ "$p" = "443" ]; then echo "https://$d"; else echo "https://$d:$p"; fi
+}
+
+need_hub() {
+    [ -f "$CADDYFILE" ] || die "нет $CADDYFILE — хаб nexus-mcp с Caddy не найден. Stitch встаёт на его домен (путь /stitch/)"
+    hub_url >/dev/null || die "в $HUB_ENV нет NEXUS_MCP_PUBLIC_HOSTS — у хаба нет публичного адреса"
+}
+
+# Из маршрута: секрет (из пути) и ключ (из заголовка). Пусто — маршрута нет.
+site_secret() { sed -n 's#^handle /stitch/mcp/\([A-Za-z0-9]*\) {#\1#p' "$SITE" 2>/dev/null | head -1 || true; }
+site_key()    { sed -n 's#^ *header_up X-Goog-Api-Key "\([^"]*\)"#\1#p' "$SITE" 2>/dev/null | head -1 || true; }
+
+connector_url() {
+    local s; s="$(site_secret)"
+    [ -n "$s" ] || return 1
+    echo "$(hub_url)/stitch/mcp/$s"
+}
+
+# Ключи Google — буквы, цифры, «-» и «_». Заодно кавычка или перевод строки не
+# сломают Caddyfile.
+valid_key() { [[ "$1" =~ ^[A-Za-z0-9_-]{20,200}$ ]]; }
+
+INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"mcp-stitch","version":"1"}}}'
+LIST='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+INITED='{"jsonrpc":"2.0","method":"notifications/initialized"}'
+
+# MCP-разговор с адресом: initialize → tools/list. Печатает число инструментов;
+# отказ — причина в stderr и код 1. $2 — файл с заголовком ключа или пусто.
+mcp_tools() {
+    local url="$1" keyhdr="${2:-}" tmp code sid n
+    tmp="$(mktemp -d)"; chmod 700 "$tmp"
+    local auth=(); [ -n "$keyhdr" ] && auth=(-H "@$keyhdr")
+    local base=(-sS --connect-timeout 10 -m 60 -X POST -H 'Content-Type: application/json'
+                -H 'Accept: application/json, text/event-stream' "${auth[@]}")
+    code="$(curl "${base[@]}" -D "$tmp/h" -o "$tmp/b" -w '%{http_code}' -d "$INIT" "$url" 2>"$tmp/e")" || code="000"
+    if [ "$code" != "200" ]; then
+        echo "HTTP $code: $(head -c 200 "$tmp/b" 2>/dev/null)$(head -c 200 "$tmp/e")" >&2
+        rm -rf "$tmp"; return 1
+    fi
+    sid="$(grep -i '^mcp-session-id:' "$tmp/h" | head -1 | cut -d: -f2- | tr -d ' \r' || true)"
+    local s=(); [ -n "$sid" ] && s=(-H "Mcp-Session-Id: $sid")
+    curl "${base[@]}" "${s[@]}" -o /dev/null -d "$INITED" "$url" 2>/dev/null || true
+    code="$(curl "${base[@]}" "${s[@]}" -o "$tmp/b" -w '%{http_code}' -d "$LIST" "$url" 2>"$tmp/e")" || code="000"
+    # Ответ — JSON или SSE; инструмент в списке — это его inputSchema.
+    n="$(grep -o '"inputSchema"' "$tmp/b" 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "$code" != "200" ] || [ "${n:-0}" = "0" ]; then
+        echo "tools/list: HTTP $code, инструментов нет: $(head -c 200 "$tmp/b")" >&2
+        rm -rf "$tmp"; return 1
+    fi
+    rm -rf "$tmp"
+    echo "$n"
+}
+
+key_header_file() {
+    local f; f="$(mktemp)"; chmod 600 "$f"
+    printf 'X-Goog-Api-Key: %s\n' "$1" > "$f"
+    echo "$f"
+}
+
+caddy_bin() {
+    local b
+    b="$(systemctl show -p ExecStart --value nexus-mcp-caddy 2>/dev/null | sed -n 's/.*path=\([^ ;]*\).*/\1/p')"
+    [ -x "$b" ] || b="$(command -v caddy || true)"
+    echo "$b"
+}
+
+# Перезагрузить Caddy хаба, проверив конфиг до этого: сломанный маршрут уронил
+# бы Caddy, а с ним весь хаб (коннекторы, чат, реле нод). Прежний маршрут —
+# копией в $SITE.prev (импорт sites/*.caddy её не видит): не принял — откат
+# байт в байт; пусто — маршрута не было.
+wipe() { if command -v shred >/dev/null 2>&1; then shred -u -z -n 1 "$1" 2>/dev/null || rm -f "$1"; else rm -f "$1"; fi; }
+
+keep_prev() { rm -f "$SITE.prev"; [ -f "$SITE" ] && cp -p "$SITE" "$SITE.prev"; return 0; }
+
+apply_site() {
+    local c out; c="$(caddy_bin)"
+    if [ -n "$c" ] && ! out="$("$c" validate --config "$CADDYFILE" --adapter caddyfile 2>&1)"; then
+        if [ -f "$SITE.prev" ]; then mv -f "$SITE.prev" "$SITE"; else wipe "$SITE"; fi
+        die "Caddy не принял маршрут Stitch — вернул как было: $(echo "$out" | tail -3)"
+    fi
+    [ -f "$SITE.prev" ] && wipe "$SITE.prev"
+    if [ -n "$c" ] && "$c" reload --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1; then
+        return 0
+    fi
+    systemctl restart nexus-mcp-caddy >/dev/null 2>&1 || die "Caddy хаба не перезагрузился: journalctl -u nexus-mcp-caddy -n 30"
+}
+
+write_site() {
+    local key="$1" secret="$2"
+    mkdir -p "$HUB_CADDY/sites"
+    keep_prev
+    ( umask 077; cat > "$SITE.tmp" <<EOF
+# mcp-stitch — Google Stitch для коннектора claude.ai (github.com/Rklm-it/mcp-stitch).
+# Ключ — здесь, поэтому файл 0600. Чужой путь под /stitch/ — 404 хаба.
+handle /stitch/mcp/$secret {
+    rewrite * /mcp
+    reverse_proxy https://stitch.googleapis.com {
+        header_up Host stitch.googleapis.com
+        header_up X-Goog-Api-Key "$key"
+        header_up -Authorization
+        header_up -Cookie
+        flush_interval -1
+    }
+}
+EOF
+    )
+    mv "$SITE.tmp" "$SITE"; chmod 600 "$SITE"
+    apply_site
+}
+
+# Терминал — первым: под `curl | bash` stdin — это сам установщик. Открываемость
+# проверяем открытием, а не [ -r ]: без управляющего терминала /dev/tty «читаем»,
+# но не открывается. Терминала нет (cron, CI) — ключ из stdin.
+read_key() {
+    local k=""
+    if { exec 3<"$TTY"; } 2>/dev/null; then
+        printf '› Ключ Stitch (ввод скрыт): ' >&2
+        IFS= read -rs k <&3 || k=""; echo >&2
+        exec 3<&-
+    else
+        IFS= read -r k || k=""
+    fi
+    printf '%s' "$k" | tr -d ' \r\n\t'
+}
+
+cmd_set_key() {
+    need_hub
+    echo "Ключ: stitch.withgoogle.com → аватар справа вверху → Stitch settings → API key → Create key."
+    local key; key="$(read_key)"
+    [ -n "$key" ] || die "ключ пустой"
+    valid_key "$key" || die "это не похоже на ключ Stitch (буквы, цифры, - и _; от 20 символов)"
+    local hf n; hf="$(key_header_file "$key")"
+    if ! n="$(mcp_tools "$STITCH_URL" "$hf")"; then rm -f "$hf"; die "Stitch не принял ключ — причина выше"; fi
+    rm -f "$hf"
+    ok "Stitch отвечает этим ключом: инструментов $n"
+    local secret; secret="$(site_secret)"; [ -n "$secret" ] || secret="$(gen 40)"
+    write_site "$key" "$secret"
+    ok "маршрут на хабе поднят"
+    cmd_check || true
+    echo
+    echo "Коннектор claude.ai (Настройки → Коннекторы → Add custom connector):"
+    echo "  $(connector_url)"
+    echo "${D}В ссылке секрет — не пересылайте её. Сменить: mcp-stitch rotate-secret${N}"
+}
+
+cmd_check() {
+    need_hub
+    local url n; url="$(connector_url)" || { bad "Stitch не подключён: mcp-stitch set-key"; return 1; }
+    if n="$(mcp_tools "$url" "")"; then
+        ok "сквозь хаб: claude.ai увидит инструментов Stitch: $n"
+    else
+        bad "через хаб Stitch не отвечает — причина выше (сертификат хаба, ключ отозван, сеть до Google)"
+        return 1
+    fi
+}
+
+cmd_rotate() {
+    need_hub
+    local key; key="$(site_key)"; [ -n "$key" ] || die "Stitch не подключён: mcp-stitch set-key"
+    write_site "$key" "$(gen 40)"
+    ok "секрет сменён — старая ссылка больше не работает. Новая (замените в claude.ai):"
+    echo "  $(connector_url)"
+}
+
+cmd_off() {
+    [ -f "$SITE" ] || { echo "Stitch и так не подключён"; return 0; }
+    keep_prev
+    wipe "$SITE"
+    apply_site
+    ok "маршрут Stitch убран, ключ с хаба стёрт. Коннектор в claude.ai удалите руками"
+}
+
+cmd_status() {
+    local key url; key="$(site_key)"
+    if [ -z "$key" ]; then
+        echo "Stitch не подключён — mcp-stitch set-key"
+        return 0
+    fi
+    echo "Stitch подключён · ключ ${key:0:4}…${key: -4}"
+    url="$(connector_url)" && echo "Коннектор claude.ai: $url"
+}
+
+cmd_update() {
+    local tmp; tmp="$(mktemp)"
+    timeout 60 curl -fsSL --connect-timeout 15 -o "$tmp" "$SRC/bin/mcp-stitch" || die "не скачалось с GitHub"
+    bash -n "$tmp" || die "скачанное не проходит проверку bash -n — не ставлю"
+    install -m 0755 "$tmp" "$0" && rm -f "$tmp" && ok "mcp-stitch обновлён"
+}
+
+case "${1:-status}" in
+    status|info) cmd_status ;;
+    url)         connector_url || { bad "Stitch не подключён: mcp-stitch set-key"; exit 1; } ;;
+    set-key)     cmd_set_key ;;
+    check)       cmd_check ;;
+    rotate-secret) cmd_rotate ;;
+    off)         cmd_off ;;
+    update)      cmd_update ;;
+    -h|--help|help) sed -n 2,12p "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "нет команды «$1» — mcp-stitch help" ;;
+esac

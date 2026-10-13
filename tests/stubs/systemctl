@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Заглушка systemctl: юнита Caddy хаба «нет» — команда берёт caddy из PATH.
+echo "systemctl $*" >> "$STUB_LOG"
+exit 0

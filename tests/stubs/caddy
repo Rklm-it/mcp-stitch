@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Заглушка Caddy: validate падает при STUB_CADDY_FAIL=1, reload — успех.
+echo "caddy $*" >> "$STUB_LOG"
+case "$1" in
+    validate) [ "${STUB_CADDY_FAIL:-}" = 1 ] && { echo "Error: adapting config: bad route" >&2; exit 1; }; exit 0 ;;
+    reload) exit 0 ;;
+esac
+exit 0
